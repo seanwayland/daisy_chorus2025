@@ -7,12 +7,16 @@ using namespace daisysp;
 DaisyPod hw;
 
 // Constants
-const int NUM_DELAYS = 6;
+const int NUM_SHORT_DELAYS = 4;  // 100ms max
+const int NUM_LONG_DELAYS = 3;   // 1s max
+const int NUM_DELAYS = NUM_SHORT_DELAYS + NUM_LONG_DELAYS;
 const int NUM_PATCHES = 4;
-const float MAX_DELAY_TIME = 1.0f; // 1 second max delay
+const float MAX_SHORT_DELAY = 0.1f; // 100ms
+const float MAX_LONG_DELAY = 1.0f;  // 1s
 
-// Delay lines
-DelayLine<float, 12000> delays[NUM_DELAYS]; // 1 second max delay at 48kHz
+// Delay lines - separate short and long delays
+DelayLine<float, 2000> shortDelays[NUM_SHORT_DELAYS];  // 100ms at 48kHz
+DelayLine<float, 36000> longDelays[NUM_LONG_DELAYS];   // 1s at 48kHz
 
 // Modulation
 Oscillator lfo[NUM_DELAYS];
@@ -20,13 +24,23 @@ float modDepth[NUM_DELAYS];
 float modRate[NUM_DELAYS];
 float baseDelayTime[NUM_DELAYS];
 float feedback[NUM_DELAYS];
-float delayLevel[NUM_DELAYS]; // Individual level for each delay
+float delayLevel[NUM_DELAYS];
 
 // Global parameters
-float dryWet; // 0-1
+float dryWet;
 int currentPatch;
 
-// Helper functions
+// Helper function to get appropriate delay line reference
+template <size_t N>
+DelayLine<float, N>& getDelayRef(DelayLine<float, N>* array, int index) {
+    return array[index];
+}
+
+// Helper function to get max delay time for a delay line
+float getMaxDelay(int index) {
+    return (index < NUM_SHORT_DELAYS) ? MAX_SHORT_DELAY : MAX_LONG_DELAY;
+}
+
 void UpdateKnobs();
 void UpdateLeds();
 void ProcessAudio(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, size_t size);
@@ -53,18 +67,10 @@ void UpdateKnobs()
         SetPatch(currentPatch);
     }
     
-    // Small knob 1 controls mod depth and dry/wet
-    float knob1 = hw.knob1.Process();
-
-    // First half of knob controls dry/wet (0-100%)
-    dryWet = knob1 * 2.0f;
+    // Small knob 1 controls dry/wet
+    dryWet = hw.knob1.Process();
     
-    // for(int i = 0; i < NUM_DELAYS; i++)
-    // {
-    //     modDepth[i] = (knob1 - 0.5f) * 1.4f;
-    // }
-    
-    // Small knob 2 controls mod rate
+    // Small knob 2 controls parameters based on patch
     float knob2 = hw.knob2.Process();
 
     switch(currentPatch)
@@ -72,32 +78,28 @@ void UpdateKnobs()
         case 0: 
             for(int i = 0; i < NUM_DELAYS; i++)
             {
-                
-                lfo[i].SetFreq(modRate[i] *knob2 * 0.5f);
+                lfo[i].SetFreq(modRate[i] * knob2 * 0.5f);
             }
             break;
                 
         case 1: 
             for(int i = 0; i < NUM_DELAYS; i++)
             {
-                feedback[i] = knob2 * 2.0f; // Reduced range for reverb modulation
-                
+                feedback[i] = knob2 * 2.0f;
             }
             break;
 
         case 2: 
             for(int i = 0; i < NUM_DELAYS; i++)
             {
-                modRate[i] = knob2 * 0.5f; // Full range for combined patch
-                lfo[i].SetFreq(modRate[i]);
+                lfo[i].SetFreq(modRate[i] * knob2 * 2.0f);
             }
             break;
 
         case 3: 
             for(int i = 0; i < NUM_DELAYS; i++)
             {
-                
-                lfo[i].SetFreq(modRate[i] *knob2 * 0.5f);
+                lfo[i].SetFreq(modRate[i] * knob2 * 0.5f);
             }
             break;
     }
@@ -148,25 +150,40 @@ void ProcessAudio(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, si
             // Calculate modulated delay time
             float mod = lfo[d].Process() * modDepth[d];
             float delayTime = baseDelayTime[d] * (1.0f + mod);
-            delayTime = fclamp(delayTime, 0.0f, MAX_DELAY_TIME);
+            delayTime = fclamp(delayTime, 0.0f, getMaxDelay(d));
             
-            delays[d].SetDelay(delayTime * hw.AudioSampleRate());
-            
-            // Read from delay
-            float delayed = delays[d].Read() * delayLevel[d];
-            
-            // Write to delay (with feedback)
-            float input = (d < 3) ? dryL : dryR; // First 3 delays are L, next 3 are R
-            delays[d].Write(input + delayed * feedback[d]);
-            
-            // Accumulate to wet signal and count active delays
-            if(d < 3) {
-                wetL += delayed;
-                activeDelaysL++;
-            }
-            else {
-                wetR += delayed;
-                activeDelaysR++;
+            if(d < NUM_SHORT_DELAYS) {
+                shortDelays[d].SetDelay(delayTime * hw.AudioSampleRate());
+                float delayed = shortDelays[d].Read() * delayLevel[d];
+                float input = (d < 2) ? dryL : dryR;
+                shortDelays[d].Write(input + delayed * feedback[d]);
+                
+                if(d < 2) {
+                    wetL += delayed;
+                    activeDelaysL++;
+                } else {
+                    wetR += delayed;
+                    activeDelaysR++;
+                }
+            } else {
+                int longDelayIdx = d - NUM_SHORT_DELAYS;
+                longDelays[longDelayIdx].SetDelay(delayTime * hw.AudioSampleRate());
+                float delayed = longDelays[longDelayIdx].Read() * delayLevel[d];
+                float input = (d < 6) ? dryL : dryR;
+                longDelays[longDelayIdx].Write(input + delayed * feedback[d]);
+                
+                if(d < 5) {
+                    wetL += delayed;
+                    activeDelaysL++;}
+                if (d == 6) {
+                    wetL += 0.5*delayed;
+                    wetR += 0.5*delayed;
+                    activeDelaysL++;
+                }
+                else {
+                    wetR += delayed;
+                    activeDelaysR++;
+                }
             }
         }
         
@@ -181,12 +198,20 @@ void ProcessAudio(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, si
 
 void InitDelays()
 {
-    for(int i = 0; i < NUM_DELAYS; i++)
-    {
-        delays[i].Init();
+    // Initialize short delays (0-3)
+    for(int i = 0; i < NUM_SHORT_DELAYS; i++) {
+        shortDelays[i].Init();
         lfo[i].Init(hw.AudioSampleRate());
         lfo[i].SetWaveform(Oscillator::WAVE_SIN);
-        delayLevel[i] = 1.0f; // Default to full level
+        delayLevel[i] = 1.0f;
+    }
+    
+    // Initialize long delays (4-6)
+    for(int i = 0; i < NUM_LONG_DELAYS; i++) {
+        longDelays[i].Init();
+        lfo[NUM_SHORT_DELAYS + i].Init(hw.AudioSampleRate());
+        lfo[NUM_SHORT_DELAYS + i].SetWaveform(Oscillator::WAVE_SIN);
+        delayLevel[NUM_SHORT_DELAYS + i] = 1.0f;
     }
     
     // Set initial patch
@@ -201,85 +226,91 @@ void SetPatch(int patch)
 {
     switch(patch)
     {
-        case 0: // Chorus patch - using 2 left and 2 right delays
-            // Left channel delays (0-2)
-            baseDelayTime[0] = 0.0236f;  // 5ms
-            baseDelayTime[1] = 0.030f;  // 7ms
-            baseDelayTime[2] = 0.0f;    // Disabled
+        case 0: // Chorus - uses only short delays
+            // Left channel delays (0-1)
+            baseDelayTime[0] = 0.0236f;
+            baseDelayTime[1] = 0.030f;
+            baseDelayTime[2] = 0.0f;    // Disabled short delay 2
+            baseDelayTime[3] = 0.0f;    // Disabled short delay 3
             
-            // Right channel delays (3-5)
-            baseDelayTime[3] = 0.0409f;  // 6ms
-            baseDelayTime[4] = 0.0482f;  // 8ms
-            baseDelayTime[5] = 0.0f;    // Disabled
+            // Right channel delays (4-5) - using long delays as shorts
+            baseDelayTime[4] = 0.0409f;
+            baseDelayTime[5] = 0.0482f;
+            baseDelayTime[6] = 0.0f;    // Disabled long delay 2
             
-            // Modulation settings
+            // Modulation settings (maintain your original values)
             modDepth[0] = 0.2f;   modRate[0] = 3.9f; feedback[0] = 0.0f; delayLevel[0] = 1.0f;
             modDepth[1] = 0.3f;   modRate[1] = 5.2f; feedback[1] = 0.0f; delayLevel[1] = 1.0f;
             modDepth[2] = 0.0f;   modRate[2] = 0.0f; feedback[2] = 0.0f; delayLevel[2] = 0.0f;
-            modDepth[3] = 0.2f;  modRate[3] = 4.0f; feedback[3] = 0.0f; delayLevel[3] = 1.0f;
-            modDepth[4] = 0.3f;  modRate[4] = 4.9f; feedback[4] = 0.0f; delayLevel[4] = 1.0f;
-            modDepth[5] = 0.0f;   modRate[5] = 0.0f; feedback[5] = 0.0f; delayLevel[5] = 0.0f;
+            modDepth[3] = 0.0f;   modRate[3] = 0.0f; feedback[3] = 0.0f; delayLevel[3] = 0.0f;
+            modDepth[4] = 0.2f;   modRate[4] = 4.0f; feedback[4] = 0.0f; delayLevel[4] = 1.0f;
+            modDepth[5] = 0.3f;   modRate[5] = 4.9f; feedback[5] = 0.0f; delayLevel[5] = 1.0f;
+            modDepth[6] = 0.0f;   modRate[6] = 0.0f; feedback[6] = 0.0f; delayLevel[6] = 0.0f;
             break;
 
-        case 3: // Chorus patch - using 2 left and 2 right delays
-            // Left channel delays (0-2)
-            baseDelayTime[0] = 0.0236f;  // 5ms
-            baseDelayTime[1] = 0.030f;  // 7ms
-            baseDelayTime[2] = 0.0f;    // Disabled
+        case 3: // Chorus - uses only short delays
+            // Left channel delays (0-1)
+            baseDelayTime[0] = 0.0236f;
+            baseDelayTime[1] = 0.030f;
+            baseDelayTime[2] = 0.0f;    // Disabled short delay 2
+            baseDelayTime[3] = 0.0f;    // Disabled short delay 3
             
-            // Right channel delays (3-5)
-            baseDelayTime[3] = 0.036f;  // 6ms
-            baseDelayTime[4] = 0.028f;  // 8ms
-            baseDelayTime[5] = 0.0f;    // Disabled
+            // Right channel delays (4-5) - using long delays as shorts
+            baseDelayTime[4] = 0.036f;
+            baseDelayTime[5] = 0.028f;
+            baseDelayTime[6] = 0.0f;    // Disabled long delay 2
             
             // Modulation settings
             modDepth[0] = 0.2f;   modRate[0] = 6.5f; feedback[0] = 0.0f; delayLevel[0] = 1.0f;
             modDepth[1] = 0.2f;   modRate[1] = 5.7f; feedback[1] = 0.0f; delayLevel[1] = 1.0f;
             modDepth[2] = 0.0f;   modRate[2] = 0.0f; feedback[2] = 0.0f; delayLevel[2] = 0.0f;
-            modDepth[3] = 0.2f;  modRate[3] = 4.8f; feedback[3] = 0.0f; delayLevel[3] = 1.0f;
-            modDepth[4] = 0.2f;  modRate[4] = 4.4f; feedback[4] = 0.0f; delayLevel[4] = 1.0f;
-            modDepth[5] = 0.0f;   modRate[5] = 0.0f; feedback[5] = 0.0f; delayLevel[5] = 0.0f;
+            modDepth[3] = 0.0f;   modRate[3] = 0.0f; feedback[3] = 0.0f; delayLevel[3] = 0.0f;
+            modDepth[4] = 0.2f;   modRate[4] = 4.8f; feedback[4] = 0.0f; delayLevel[4] = 1.0f;
+            modDepth[5] = 0.2f;   modRate[5] = 4.4f; feedback[5] = 0.0f; delayLevel[5] = 1.0f;
+            modDepth[6] = 0.0f;   modRate[6] = 0.0f; feedback[6] = 0.0f; delayLevel[6] = 0.0f;
             break;
             
-        case 1: // Reverb patch - using 2 left and 2 right delays
-            // Left channel delays
-            baseDelayTime[0] = 0.25f; // 25ms
-            baseDelayTime[1] = 0.35f; // 35ms
-            baseDelayTime[2] = 0.0f;   // Disabled
+        case 1: // Reverb - uses only long delays
+            // Left channel delays (4-5)
+            baseDelayTime[0] = 0.0f;    // Disabled short delay 0
+            baseDelayTime[1] = 0.0f;    // Disabled short delay 1
+            baseDelayTime[2] = 0.0f;    // Disabled short delay 2
+            baseDelayTime[3] = 0.0f;    // Disabled short delay 3
             
-            // Right channel delays
-            baseDelayTime[3] = 0.40f; // 30ms
-            baseDelayTime[4] = 0.50f; // 40ms
-            baseDelayTime[5] = 0.0f;   // Disabled
+            baseDelayTime[4] = 0.30f;
+            baseDelayTime[5] = 0.7f;
+            baseDelayTime[6] = 0.47f;    // Disabled long delay 2
             
+            // Right channel delays (using some long delays)
             // Modulation settings
-            modDepth[0] = 0.00f;  modRate[0] = 0.0f; feedback[0] = 0.07f; delayLevel[0] = 1.0f;
-            modDepth[1] = 0.00f;  modRate[1] = 0.0f; feedback[1] = 0.065f; delayLevel[1] = 1.0f;
+            modDepth[0] = 0.0f;   modRate[0] = 0.0f; feedback[0] = 0.0f; delayLevel[0] = 0.0f;
+            modDepth[1] = 0.0f;   modRate[1] = 0.0f; feedback[1] = 0.0f; delayLevel[1] = 0.0f;
             modDepth[2] = 0.0f;   modRate[2] = 0.0f; feedback[2] = 0.0f; delayLevel[2] = 0.0f;
-            modDepth[3] = 0.0f; modRate[3] = 0.00f; feedback[3] = 0.068f; delayLevel[3] = 1.0f;
-            modDepth[4] = 0.0f; modRate[4] = 0.00f; feedback[4] = 0.072f; delayLevel[4] = 1.0f;
-            modDepth[5] = 0.0f;    modRate[5] = 0.0f; feedback[5] = 0.0f; delayLevel[5] = 0.0f;
+            modDepth[3] = 0.0f;   modRate[3] = 0.0f; feedback[3] = 0.0f; delayLevel[3] = 0.0f;
+            modDepth[4] = 0.00f;  modRate[4] = 0.0f; feedback[4] = 0.07f; delayLevel[4] = 1.0f;
+            modDepth[5] = 0.00f;  modRate[5] = 0.0f; feedback[5] = 0.065f; delayLevel[5] = 1.0f;
+            modDepth[6] = 0.0f;   modRate[6] = 0.0f; feedback[6] = 0.05f; delayLevel[6] = 1.0f;
             break;
             
-        case 2: // Combined patch - using all delays
-            // Left channel - first 2 chorus, 1 reverb
-            baseDelayTime[0] = 0.0236f;  // 5ms
-            baseDelayTime[1] = 0.030f;  // 7ms
-            baseDelayTime[2] = 0.5f;    // Disabled
+        case 2: // Combined - uses both short and long delays
+            // Left channel - short delays (0-1)
+            baseDelayTime[0] = 0.0236f;
+            baseDelayTime[1] = 0.030f;
+            baseDelayTime[2] = 0.0409f;    // Disabled short delay 2
+            baseDelayTime[3] = 0.0402f;    // Disabled short delay 3
             
-            // Right channel delays (3-5)
-            baseDelayTime[3] = 0.036f;  // 6ms
-            baseDelayTime[4] = 0.35f;  // 8ms
-            baseDelayTime[5] = 0.6f;    // Disabled
+            baseDelayTime[4] = 0.30f;
+            baseDelayTime[5] = 0.7f;
+            baseDelayTime[6] = 0.47f;    // Disabled long delay 2
             
             // Modulation settings
             modDepth[0] = 0.2f;   modRate[0] = 6.5f; feedback[0] = 0.0f; delayLevel[0] = 1.0f;
             modDepth[1] = 0.2f;   modRate[1] = 5.7f; feedback[1] = 0.0f; delayLevel[1] = 1.0f;
-            modDepth[2] = 0.0f;   modRate[2] = 0.0f; feedback[2] = 0.1f; delayLevel[2] = 0.2f;
-            modDepth[3] = 0.2f;  modRate[3] = 4.8f; feedback[3] = 0.0f; delayLevel[3] = 1.0f;
-            modDepth[4] = 0.0f;  modRate[4] = 4.4f; feedback[4] = 0.1f; delayLevel[4] = 0.2f;
-            modDepth[5] = 0.0f;   modRate[5] = 0.0f; feedback[5] = 0.1f; delayLevel[5] = 0.2f;
-            
+            modDepth[2] = 0.2f;   modRate[2] = 6.0f; feedback[2] = 0.0f; delayLevel[2] = 1.0f;
+            modDepth[3] = 0.2f;   modRate[3] = 6.0f; feedback[3] = 0.0f; delayLevel[3] = 1.0f;
+            modDepth[4] = 0.0f;   modRate[4] = 0.0f; feedback[4] = 0.1f; delayLevel[4] = 0.2f;
+            modDepth[5] = 0.0f;   modRate[5] = 4.4f; feedback[5] = 0.1f; delayLevel[5] = 0.2f;
+            modDepth[6] = 0.0f;   modRate[6] = 0.0f; feedback[6] = 0.1f; delayLevel[6] = 0.2f;
             break;
     }
     
@@ -294,8 +325,7 @@ int main(void)
 {
     hw.Init();
     //hw.SetAudioSampleRate(SaiHandle::Config::SampleRate::SAI_96KHZ);
-    //hw.SetAudioBlockSize(4); // You may want to adjust this for 96kHz
-    hw.SetAudioBlockSize(8); // Small block size for better responsiveness
+    hw.SetAudioBlockSize(4);
     
     InitDelays();
     
